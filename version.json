@@ -1,6 +1,1 @@
-{
-  "versionCode": 1,
-  "version": "1.0.0",
-  "apkUrl": "https://github.com/ScriptPilotX/kragwag/releases/download/android-v1.0.0/KragWagApp.apk",
-  "releaseNotes": "Initial release"
-}
+{"versionCode":2,"version":"1.1.0","apkUrl":"https://github.com/ScriptPilotX/kragwag/releases/download/android-v1.1.0/KragWagApp.apk","releaseNotes":"Live OTA status updates — see firmware update progress directly in the app"}
