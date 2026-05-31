@@ -1,1 +1,1 @@
-{"versionCode":12,"version":"1.3.1","apkUrl":"https://github.com/ScriptPilotX/kragwag/releases/download/android-v1.3.1/KragWagApp.apk","releaseNotes":"Fix live mode toggle; add last-updated timestamp"}
+{"versionCode":13,"version":"1.3.2","apkUrl":"https://github.com/ScriptPilotX/kragwag/releases/download/android-v1.3.2/KragWagApp.apk","releaseNotes":"Live mode now polls ESP32 directly at 1s via local network"}
