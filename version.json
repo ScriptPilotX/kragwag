@@ -1,1 +1,1 @@
-{"versionCode":24,"version":"1.5.8","apkUrl":"https://github.com/ScriptPilotX/kragwag/releases/download/v1.5.8/kragwag-v1.5.8.apk","releaseNotes":"Fixed garbled text, status bar, notification icon, heap OTA fix"}
+{"versionCode":25,"version":"1.5.9","apkUrl":"https://github.com/ScriptPilotX/kragwag/releases/download/v1.5.9/kragwag-v1.5.9.apk","releaseNotes":"Fixed status bar overlap on all Android versions"}
