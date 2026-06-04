@@ -1,6 +1,6 @@
 {
-  "versionCode": 29,
-  "version": "1.6.2",
-  "apkUrl": "https://github.com/ScriptPilotX/kragwag/releases/download/v1.6.2/kragwagapp-release.apk",
+  "versionCode": 30,
+  "version": "1.6.3",
+  "apkUrl": "https://github.com/ScriptPilotX/kragwag/releases/download/v1.6.3/app-release.apk",
   "releaseNotes": "Panic Alarm button (hold 2s to activate), Gate 3 repurposed for panic trigger"
 }
