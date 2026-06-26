@@ -1,6 +1,3 @@
---ea7fa4d837bedb4581dde739c114100b94d224ee7d480814edd2da3ab808
-Content-Disposition: form-data; name="index.js"
-
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -22,6 +19,9 @@ var index_default = {
       const nodeId = body.nodeId.replace(/﻿/g, "").trim();
       await env.HEARTBEAT.put(`hb:${nodeId}`, String(Date.now()), { expirationTtl: 3600 });
       await env.HEARTBEAT.delete(`offline:${nodeId}`);
+      await env.HEARTBEAT.put(`reg:${nodeId}`, "1");
+      if (body.freeHeap !== undefined)
+        await env.HEARTBEAT.put(`heap:${nodeId}`, String(body.freeHeap));
       return new Response("ok", { status: 200 });
     }
     if (url.pathname === "/notify") {
@@ -31,17 +31,21 @@ var index_default = {
     }
     return new Response("Not found", { status: 404 });
   },
-  // Cron: runs every 5 minutes — checks for stale heartbeats
+  // Cron: runs every 5 minutes — checks for stale heartbeats using reg: keys (permanent)
+  // so devices offline for >1h are still detected even after hb: key expires.
   async scheduled(event, env, ctx) {
-    const list = await env.HEARTBEAT.list({ prefix: "hb:" });
+    const list = await env.HEARTBEAT.list({ prefix: "reg:" });
     const now = Date.now();
     const OFFLINE_THRESHOLD_MS = 10 * 60 * 1e3;
     for (const key of list.keys) {
-      const nodeId = key.name.slice(3);
-      const ts = await env.HEARTBEAT.get(key.name);
-      if (!ts) continue;
-      const age = now - parseInt(ts, 10);
-      if (age > OFFLINE_THRESHOLD_MS) {
+      const nodeId = key.name.slice(4);
+      const hbVal = await env.HEARTBEAT.get(`hb:${nodeId}`);
+      let isOffline = !hbVal;
+      if (!isOffline) {
+        const age = now - parseInt(hbVal, 10);
+        if (age > OFFLINE_THRESHOLD_MS) isOffline = true;
+      }
+      if (isOffline) {
         const alerted = await env.HEARTBEAT.get(`offline:${nodeId}`);
         if (!alerted) {
           await sendFCM(env, nodeId, "KragWag Offline", "The fence monitor has not been seen for over 10 minutes.");
@@ -140,6 +144,3 @@ __name(pemToArrayBuffer, "pemToArrayBuffer");
 export {
   index_default as default
 };
-//# sourceMappingURL=index.js.map
-
---ea7fa4d837bedb4581dde739c114100b94d224ee7d480814edd2da3ab808--
