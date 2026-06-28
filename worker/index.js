@@ -17,7 +17,10 @@ var index_default = {
     if (url.pathname === "/heartbeat") {
       if (!body.nodeId) return new Response("Missing nodeId", { status: 400 });
       const nodeId = body.nodeId.replace(/﻿/g, "").trim();
-      await env.HEARTBEAT.put(`hb:${nodeId}`, String(Date.now()), { expirationTtl: 3600 });
+      // Store "1" with 15-min TTL — key existence is the freshness signal, not the value.
+      // Date.now() in Cloudflare Worker isolates can be stale (cached from isolate creation),
+      // so timestamp-based age checks are unreliable. TTL expiry is always accurate.
+      await env.HEARTBEAT.put(`hb:${nodeId}`, "1", { expirationTtl: 900 });
       await env.HEARTBEAT.delete(`offline:${nodeId}`);
       await env.HEARTBEAT.put(`reg:${nodeId}`, "1");
       if (body.freeHeap !== undefined)
@@ -31,24 +34,19 @@ var index_default = {
     }
     return new Response("Not found", { status: 404 });
   },
-  // Cron: runs every 5 minutes — checks for stale heartbeats using reg: keys (permanent)
-  // so devices offline for >1h are still detected even after hb: key expires.
+  // Cron: runs every 5 minutes. Checks reg: keys (permanent) so devices offline >15 min
+  // are detected even after hb: key expires. Uses key existence, not timestamp age —
+  // Date.now() in Workers isolates is unreliable for age calculations.
   async scheduled(event, env, ctx) {
     const list = await env.HEARTBEAT.list({ prefix: "reg:" });
-    const now = Date.now();
-    const OFFLINE_THRESHOLD_MS = 10 * 60 * 1e3;
     for (const key of list.keys) {
       const nodeId = key.name.slice(4);
       const hbVal = await env.HEARTBEAT.get(`hb:${nodeId}`);
-      let isOffline = !hbVal;
-      if (!isOffline) {
-        const age = now - parseInt(hbVal, 10);
-        if (age > OFFLINE_THRESHOLD_MS) isOffline = true;
-      }
+      const isOffline = !hbVal;  // key expired (>15 min no heartbeat) = offline
       if (isOffline) {
         const alerted = await env.HEARTBEAT.get(`offline:${nodeId}`);
         if (!alerted) {
-          await sendFCM(env, nodeId, "KragWag Offline", "The fence monitor has not been seen for over 10 minutes.");
+          await sendFCM(env, nodeId, "KragWag Offline", "The fence monitor has not been seen for over 15 minutes.");
           await env.HEARTBEAT.put(`offline:${nodeId}`, "1", { expirationTtl: 86400 });
         }
       }
