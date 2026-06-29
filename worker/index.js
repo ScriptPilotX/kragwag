@@ -17,14 +17,11 @@ var index_default = {
     if (url.pathname === "/heartbeat") {
       if (!body.nodeId) return new Response("Missing nodeId", { status: 400 });
       const nodeId = body.nodeId.replace(/﻿/g, "").trim();
-      // Store "1" with 15-min TTL — key existence is the freshness signal, not the value.
-      // Date.now() in Cloudflare Worker isolates can be stale (cached from isolate creation),
-      // so timestamp-based age checks are unreliable. TTL expiry is always accurate.
+      // 1 write + 1 delete per heartbeat — reg: and heap: removed to stay within
+      // Cloudflare KV free tier (1,000 writes/day). reg: keys are permanent and
+      // already set; heap: tracking dropped since heap is confirmed stable on Build 46.
       await env.HEARTBEAT.put(`hb:${nodeId}`, "1", { expirationTtl: 900 });
       await env.HEARTBEAT.delete(`offline:${nodeId}`);
-      await env.HEARTBEAT.put(`reg:${nodeId}`, "1");
-      if (body.freeHeap !== undefined)
-        await env.HEARTBEAT.put(`heap:${nodeId}`, String(body.freeHeap));
       return new Response("ok", { status: 200 });
     }
     if (url.pathname === "/notify") {
@@ -34,15 +31,14 @@ var index_default = {
     }
     return new Response("Not found", { status: 404 });
   },
-  // Cron: runs every 5 minutes. Checks reg: keys (permanent) so devices offline >15 min
-  // are detected even after hb: key expires. Uses key existence, not timestamp age —
-  // Date.now() in Workers isolates is unreliable for age calculations.
+  // Cron: runs every 5 minutes. Scans reg: keys (permanent, set once per device)
+  // and checks hb: key existence (15-min TTL). If hb: expired, device is offline.
   async scheduled(event, env, ctx) {
     const list = await env.HEARTBEAT.list({ prefix: "reg:" });
     for (const key of list.keys) {
       const nodeId = key.name.slice(4);
       const hbVal = await env.HEARTBEAT.get(`hb:${nodeId}`);
-      const isOffline = !hbVal;  // key expired (>15 min no heartbeat) = offline
+      const isOffline = !hbVal;
       if (isOffline) {
         const alerted = await env.HEARTBEAT.get(`offline:${nodeId}`);
         if (!alerted) {
