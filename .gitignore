@@ -1,0 +1,12 @@
+# Arduino build output
+firmware/build/
+build/
+firmware-build/
+
+# Local compile logs from the release skill
+compile_out.txt
+compile_stderr.txt
+compile_stdout.txt
+
+# Zipped source backups (the .ino itself is tracked)
+*.ino.zip
