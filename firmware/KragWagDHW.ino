@@ -74,12 +74,24 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    4        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    5        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
-#define OTA_VERSION_URL  "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/version.txt"
-#define OTA_FIRMWARE_URL "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/kragwag.bin"
+// The DHW board has its OWN update channel, separate from the alarm/fence
+// firmware. This matters: the two build counters are independent, and the
+// alarm channel's version.txt reads 46 while this firmware is on a single
+// digit. Sharing a channel meant this board saw itself as dozens of builds
+// behind and would happily download the 1.75 MB FENCE image and flash itself
+// with it, replacing the hot water controller with an energiser controller.
+//
+// Separate URLs alone are not enough, because "fetch this address and flash
+// whatever comes back" still trusts a typo, a swapped file, or a 404 page.
+// So the manifest names the variant it is for, and this firmware refuses
+// anything that is not its own. The alarm firmware is untouched and keeps
+// reading its plain version.txt at the repo root.
+#define OTA_VARIANT      "kragwag-dhw"
+#define OTA_MANIFEST_URL "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/version.json"
 
 // -- RainMaker provisioning ----------------------------------------------------
 #define PROV_SERVICE_NAME  "PROV_KragWag"
@@ -793,6 +805,35 @@ inline void setOtaStatus(const char *msg) {
   kragwagDev.updateAndReportParam(PN_OTA_STATUS, msg);
 }
 
+// Last OTA outcome in plain words, for the local config page. RainMaker is
+// not a reliable way to see this on the DHW board -- param writes do not
+// reach it -- so the board says it itself.
+String otaLastResult = "not checked yet";
+
+// Minimal JSON field readers. The manifest is small, written by our own
+// release step, and this file deliberately carries no JSON library.
+String jsonStr(const String& src, const char* key) {
+  String needle = String("\"") + key + "\"";
+  int k = src.indexOf(needle);
+  if (k < 0) return "";
+  int colon = src.indexOf(':', k + needle.length());
+  if (colon < 0) return "";
+  int q1 = src.indexOf('"', colon + 1);
+  if (q1 < 0) return "";
+  int q2 = src.indexOf('"', q1 + 1);
+  if (q2 < 0) return "";
+  return src.substring(q1 + 1, q2);
+}
+
+int jsonInt(const String& src, const char* key) {
+  String needle = String("\"") + key + "\"";
+  int k = src.indexOf(needle);
+  if (k < 0) return -1;
+  int colon = src.indexOf(':', k + needle.length());
+  if (colon < 0) return -1;
+  return src.substring(colon + 1).toInt();
+}
+
 void runOTA() {
   if (ESP.getFreeHeap() < 70000) {
     Serial.printf("[OTA] Heap too low (%u bytes), restarting\n", ESP.getFreeHeap());
@@ -807,13 +848,14 @@ void runOTA() {
 
   setOtaStatus("Checking for updates...");
   HTTPClient http;
-  http.begin(client, OTA_VERSION_URL);
-  http.addHeader("User-Agent", "KragWag-OTA/" FIRMWARE_VERSION);
+  http.begin(client, OTA_MANIFEST_URL);
+  http.addHeader("User-Agent", "KragWag-OTA/" FIRMWARE_VERSION " (" OTA_VARIANT ")");
   int code = http.GET();
 
   if (code != HTTP_CODE_OK) {
-    String errMsg = String("Update failed (HTTP ") + code + ")";
+    String errMsg = String("Update check failed (HTTP ") + code + ")";
     setOtaStatus(errMsg.c_str());
+    otaLastResult = errMsg;
     if (settingNotifyOTA)
       esp_rmaker_raise_alert(
           (String("OTA: Version check failed HTTP ") + code
@@ -825,11 +867,37 @@ void runOTA() {
 
   String body = http.getString();
   body.trim();
-  int remoteBuild = body.toInt();
+  http.end();
+
+  // Hand-rolled parse, matching this file's existing style (no ArduinoJson).
+  // The manifest is small and written by our own release step:
+  //   {"variant":"kragwag-dhw","build":6,"url":"https://...","md5":"..."}
+  String variant  = jsonStr(body, "variant");
+  String imageUrl = jsonStr(body, "url");
+  String imageMd5 = jsonStr(body, "md5");
+  int remoteBuild = jsonInt(body, "build");
+
+  // THE GUARD. If this is not our variant, stop -- do not flash, do not
+  // "try anyway". Wrong channel, wrong file, or an HTML error page all land
+  // here, and all of them are reasons to refuse rather than reasons to hope.
+  if (variant != OTA_VARIANT) {
+    String msg = String("Refused: manifest is for '") + variant
+               + "', not '" + OTA_VARIANT + "'";
+    setOtaStatus(msg.c_str());
+    otaLastResult = msg;
+    if (settingNotifyOTA) esp_rmaker_raise_alert(("OTA: " + msg).c_str());
+    return;
+  }
+
+  if (imageUrl.length() == 0 || remoteBuild <= 0) {
+    setOtaStatus("Refused: manifest is malformed");
+    otaLastResult = "Refused: manifest is malformed";
+    return;
+  }
 
   if (remoteBuild <= FIRMWARE_BUILD) {
-    http.end();
     setOtaStatus((String("Already on latest build (") + FIRMWARE_BUILD + ")").c_str());
+    otaLastResult = String("Already on the latest build (") + FIRMWARE_BUILD + ")";
     if (settingNotifyOTA)
       esp_rmaker_raise_alert(
           (String("OTA: Already on latest build (") + FIRMWARE_BUILD + ")").c_str());
@@ -842,12 +910,13 @@ void runOTA() {
         (String("OTA: Update available  - downloading build ") + remoteBuild + "...").c_str());
   delay(2000);
 
-  http.begin(client, OTA_FIRMWARE_URL);
-  http.addHeader("User-Agent", "KragWag-OTA/" FIRMWARE_VERSION);
+  http.begin(client, imageUrl);
+  http.addHeader("User-Agent", "KragWag-OTA/" FIRMWARE_VERSION " (" OTA_VARIANT ")");
   int dlCode = http.GET();
 
   if (dlCode != HTTP_CODE_OK) {
     setOtaStatus((String("Download failed (HTTP ") + dlCode + ")").c_str());
+    otaLastResult = String("Download failed (HTTP ") + dlCode + ")";
     if (settingNotifyOTA)
       esp_rmaker_raise_alert(
           (String("OTA: Download failed HTTP ") + dlCode
@@ -858,6 +927,7 @@ void runOTA() {
 
   int contentLen = http.getSize();
   if (contentLen <= 0) {
+    otaLastResult = "Download had no length";
     if (settingNotifyOTA)
       esp_rmaker_raise_alert("OTA: No Content-Length in response");
     http.end();
@@ -865,8 +935,13 @@ void runOTA() {
   }
 
   setOtaStatus("Installing...");
+  // A second integrity check on top of the variant guard: if the manifest
+  // carries an md5, Update rejects a truncated or corrupted download rather
+  // than committing a half-written image to the other app partition.
+  if (imageMd5.length() == 32) Update.setMD5(imageMd5.c_str());
   if (!Update.begin(contentLen, U_FLASH)) {
     setOtaStatus("Install failed  - try again");
+    otaLastResult = String("Install could not start (err ") + Update.getError() + ")";
     if (settingNotifyOTA)
       esp_rmaker_raise_alert(
           (String("OTA: Update.begin failed err=") + Update.getError()).c_str());
@@ -879,6 +954,8 @@ void runOTA() {
 
   if (!Update.end() || !Update.isFinished()) {
     setOtaStatus("Install failed  - try again");
+    otaLastResult = String("Install failed (err ") + Update.getError()
+                  + ") -- image rejected, running firmware untouched";
     if (settingNotifyOTA)
       esp_rmaker_raise_alert(
           (String("OTA: Write failed err=") + Update.getError()).c_str());
@@ -1219,7 +1296,7 @@ static const char CONFIG_PAGE[] PROGMEM = R"KWCFG(<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>KragWag Setup</title>
 <style>
-*{box-sizing:border-box}html{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#181a1b;color:#f4f5f5;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}.card{width:100%;max-width:420px;padding:30px;border:1px solid #3b4042;border-radius:18px;background:#242729;box-shadow:0 18px 45px #0006}h1{margin:0 0 24px;font-size:1.75rem;line-height:1.2;letter-spacing:-.02em}.status{display:grid;gap:1px;margin:0 0 26px;border:1px solid #3b4042;border-radius:12px;overflow:hidden;background:#3b4042}.row{padding:12px 14px;background:#2b2f31}.label,label{display:block;margin:0 0 6px;color:#aeb6b9;font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase}.value{display:block;color:#fff;font-size:.95rem;line-height:1.35;overflow-wrap:anywhere}label{margin:0 0 8px}.field{margin:0 0 18px}input,button{width:100%;min-height:48px;border-radius:10px;font:inherit}input{padding:11px 13px;border:1px solid #555d60;background:#191b1c;color:#fff;outline:0}input:focus{border-color:#6dc8af;box-shadow:0 0 0 3px #6dc8af33}button{margin-top:6px;border:0;background:#6dc8af;color:#10251f;font-weight:750;cursor:pointer}button:hover{background:#82d4bd}button:focus-visible{outline:3px solid #baf3e3;outline-offset:3px}button:active{transform:translateY(1px)}
+*{box-sizing:border-box}html{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#181a1b;color:#f4f5f5;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}.card{width:100%;max-width:420px;padding:30px;border:1px solid #3b4042;border-radius:18px;background:#242729;box-shadow:0 18px 45px #0006}h1{margin:0 0 24px;font-size:1.75rem;line-height:1.2;letter-spacing:-.02em}.status{display:grid;gap:1px;margin:0 0 26px;border:1px solid #3b4042;border-radius:12px;overflow:hidden;background:#3b4042}.row{padding:12px 14px;background:#2b2f31}.label,label{display:block;margin:0 0 6px;color:#aeb6b9;font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase}.value{display:block;color:#fff;font-size:.95rem;line-height:1.35;overflow-wrap:anywhere}label{margin:0 0 8px}.field{margin:0 0 18px}input,button{width:100%;min-height:48px;border-radius:10px;font:inherit}input{padding:11px 13px;border:1px solid #555d60;background:#191b1c;color:#fff;outline:0}input:focus{border-color:#6dc8af;box-shadow:0 0 0 3px #6dc8af33}button{margin-top:6px;border:0;background:#6dc8af;color:#10251f;font-weight:750;cursor:pointer}button:hover{background:#82d4bd}button:focus-visible{outline:3px solid #baf3e3;outline-offset:3px}button:active{transform:translateY(1px)}button.secondary{background:#2b2f31;color:#dfe4e6;border:1px solid #555d60}button.secondary:hover{background:#343a3c}
 </style>
 </head>
 <body>
@@ -1230,11 +1307,16 @@ static const char CONFIG_PAGE[] PROGMEM = R"KWCFG(<!doctype html>
 <div class="row"><span class="label">API key</span><span class="value">{{KEYSTATE}}</span></div>
 <div class="row"><span class="label">Last hub reply</span><span class="value">{{HUBREPLY}}</span></div>
 <div class="row"><span class="label">Firmware build</span><span class="value">{{BUILD}}</span></div>
+<div class="row"><span class="label">Free memory</span><span class="value">{{HEAP}}</span></div>
+<div class="row"><span class="label">Last update check</span><span class="value">{{OTARESULT}}</span></div>
 </section>
 <form action="/config" method="post">
 <div class="field"><label for="huburl">Hub URL</label><input id="huburl" name="huburl" type="text" value="{{HUBURL}}"></div>
 <div class="field"><label for="hubkey">Hub API Key</label><input id="hubkey" name="hubkey" type="text" autocomplete="off" spellcheck="false"></div>
 <button type="submit">Save</button>
+</form>
+<form action="/ota" method="post" style="margin-top:14px">
+<button type="submit" class="secondary">Check for firmware updates</button>
 </form>
 </main>
 </body>
@@ -1261,7 +1343,21 @@ void handleConfigPage() {
                                  : String("not set"));
   page.replace("{{HUBREPLY}}", hubReplyText());
   page.replace("{{BUILD}}",    String(FIRMWARE_BUILD));
+  // OTA needs roughly 70 KB free to run, so this is not idle trivia.
+  page.replace("{{HEAP}}",     String(ESP.getFreeHeap() / 1024) + " KB"
+                               + (ESP.getFreeHeap() < 70000 ? " (too low for an update)" : ""));
+  page.replace("{{OTARESULT}}", otaLastResult);
   localServer.send(200, "text/html", page);
+}
+
+void handleOtaRequest() {
+  // Run the check from the main loop rather than inside this handler: OTA
+  // reboots the board on success, and doing that with an HTTP response
+  // half-written leaves the browser hanging on a dead socket.
+  otaCheckRequested = true;
+  otaLastResult = "checking now, reload in a moment...";
+  localServer.sendHeader("Location", "/");
+  localServer.send(303, "text/plain", "Checking");
 }
 
 void handleConfigSave() {
@@ -1302,6 +1398,9 @@ void handleStatusJson() {
               + ",\"key_len\":" + hubKey.length()
               + ",\"last_hub_http\":" + lastIngestHttp
               + ",\"test_mode\":" + (commissioningActive() ? 1 : 0)
+              + ",\"free_heap\":" + ESP.getFreeHeap()
+              + ",\"ota_variant\":\"" OTA_VARIANT "\""
+              + ",\"ota_last\":\"" + otaLastResult + "\""
               + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
   localServer.sendHeader("Access-Control-Allow-Origin", "*");
   localServer.send(200, "application/json", json);
@@ -1445,6 +1544,7 @@ void setup() {
   localServer.on("/",       HTTP_GET,  handleConfigPage);
   localServer.on("/config", HTTP_POST, handleConfigSave);
   localServer.on("/status", HTTP_GET,  handleStatusJson);
+  localServer.on("/ota",    HTTP_POST, handleOtaRequest);
 
   localServer.on("/rssi", HTTP_GET, []() {
     String json = String("{\"rssi\":") + WiFi.RSSI() + "}";
