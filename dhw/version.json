@@ -1,7 +1,7 @@
 {
-  "variant": "kragwag-dhw",
-  "build": 6,
+  "variant": "kragwag-fence",
+  "build": 99,
   "url": "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/kragwag-dhw.bin",
   "md5": "cd88d464df83eb6a7e6a90a733d579cf",
-  "notes": "Separate OTA channel for the DHW cylinder controller. The fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
+  "notes": "TEMPORARY guard test. Variant is deliberately wrong and the build is deliberately high, so the DHW board must refuse. The url deliberately still points at the DHW image, so that if the guard were broken the board would merely reflash the build it is already running rather than take fence firmware. Reverted immediately after the test."
 }
