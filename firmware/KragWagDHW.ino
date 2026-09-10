@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    5        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    6        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -834,12 +834,50 @@ int jsonInt(const String& src, const char* key) {
   return src.substring(colon + 1).toInt();
 }
 
+// Free heap needed before attempting an update. The alarm firmware used
+// 70000, which this build never reaches -- it runs a local web server the
+// alarm firmware does not have, and settles around 53 KB. A lower bar is
+// defensible here because a FAILED update is not a broken board: the image
+// is written to the inactive app partition and the bootloader only switches
+// to it after Update.end() succeeds. Run out of memory halfway and the
+// running firmware carries on untouched. So the cost of trying and failing
+// is one wasted download, not a bricked controller.
+#define OTA_MIN_HEAP        48000
+
+// If heap is below even that, restarting genuinely helps -- but only if
+// something then retries, otherwise the restart just looks like a crash and
+// the update never happens. This flag survives the restart in NVS and makes
+// the next boot check for updates while memory is at its freest.
+#define NVS_KEY_OTA_BOOT    "ota_boot"
+bool otaRetryAfterBoot = false;   // set during setup() from that flag
+
 void runOTA() {
-  if (ESP.getFreeHeap() < 70000) {
-    Serial.printf("[OTA] Heap too low (%u bytes), restarting\n", ESP.getFreeHeap());
-    setOtaStatus((String("Restarting (heap=") + ESP.getFreeHeap() + ")").c_str());
+  // The web server is idle almost all the time and its buffers are worth
+  // more as OTA headroom. It comes back on the next boot either way.
+  if (localServerStarted) {
+    localServer.stop();
+    localServerStarted = false;
+  }
+
+  if (ESP.getFreeHeap() < OTA_MIN_HEAP) {
+    if (otaRetryAfterBoot) {
+      // Already restarted once for this. Restarting again would be a loop.
+      String msg = String("Not enough memory even after a restart (")
+                 + ESP.getFreeHeap() + " bytes free)";
+      Serial.printf("[OTA] %s\n", msg.c_str());
+      setOtaStatus(msg.c_str());
+      otaLastResult = msg;
+      if (settingNotifyOTA) esp_rmaker_raise_alert(("OTA: " + msg).c_str());
+      return;
+    }
+    Serial.printf("[OTA] Heap too low (%u bytes), restarting to retry\n", ESP.getFreeHeap());
+    setOtaStatus((String("Restarting to free memory (heap=") + ESP.getFreeHeap() + ")").c_str());
+    otaLastResult = "restarting to free memory, will retry automatically";
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putBool(NVS_KEY_OTA_BOOT, true);
+    prefs.end();
     if (settingNotifyOTA)
-      esp_rmaker_raise_alert((String("OTA: heap=") + ESP.getFreeHeap() + " - restarting").c_str());
+      esp_rmaker_raise_alert((String("OTA: heap=") + ESP.getFreeHeap() + " - restarting to retry").c_str());
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
   }
@@ -1435,6 +1473,14 @@ void setup() {
   // -- Load settings from NVS --
   loadSettingsFromNVS();
 
+  // Did the last run restart itself specifically to free memory for an
+  // update? Clear the flag first, so a crash loop cannot be sustained by it,
+  // then arrange to check again once WiFi is up.
+  prefs.begin(NVS_NAMESPACE, false);
+  otaRetryAfterBoot = prefs.getBool(NVS_KEY_OTA_BOOT, false);
+  if (otaRetryAfterBoot) prefs.putBool(NVS_KEY_OTA_BOOT, false);
+  prefs.end();
+
   // -- RainMaker — board-level device --------------------------------------
   {
     Param p(PN_VOLTAGE, "esp.param.temperature", value(0.0f), PROP_FLAG_READ);
@@ -1637,6 +1683,7 @@ void loop() {
     localServer.begin();
     localServerStarted = true;
     kragwagDev.updateAndReportParam(PN_LOCAL_IP, WiFi.localIP().toString().c_str());
+    if (otaRetryAfterBoot) otaCheckRequested = true;   // resume the interrupted update
   }
   if (localServerStarted) localServer.handleClient();
 
