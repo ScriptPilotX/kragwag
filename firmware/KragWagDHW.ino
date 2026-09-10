@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    1        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    3        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -168,6 +168,23 @@
 #define DHW_SENSOR_TIMEOUT_MS 30000UL // no valid temp reading in this long -> fail safe (off)
 #define NTC_SUPPLY_VOLTS      3.3f    // assumed ADS1115/NTC divider supply -- CONFIRM against hardware
 
+// -- Commissioning ("test") mode ------------------------------------------------
+// Lets the relays be driven on the bench BEFORE any temperature sensor exists,
+// so contactors and wiring can be proven. It is not a safety override, and it
+// is deliberately narrow:
+//
+//   * It relaxes ONLY the missing-sensor case. If a sensor IS reading and the
+//     tank is at or above DHW_SAFETY_MAX_C, the overtemp lockout still fires
+//     and still wins. Test mode can never mask a hot cylinder.
+//   * It expires on its own after DHW_COMMISSION_MS with no further input.
+//   * It lives in RAM only, so a reset or power cycle clears it.
+//   * On expiry both elements are commanded off, so an old "on" cannot come
+//     back to life the next time test mode is entered.
+//
+// NEVER leave this active with an immersion element connected to a cylinder
+// that is not full. Dry firing destroys the element in seconds.
+#define DHW_COMMISSION_MS     (15UL * 60UL * 1000UL)   // 15 minutes, then self-cancels
+
 // -- NVS -----------------------------------------------------------------------
 #define NVS_NAMESPACE      "kragwag"
 #define NVS_KEY_LED_BRIGHT "led_bright"
@@ -226,6 +243,15 @@ LedState whiteLed = {false, 0, 0};
 Preferences   prefs;
 WebServer     localServer(8080);
 bool          localServerStarted = false;
+
+// Last HTTP status the hub returned to our telemetry POST. Written from the
+// ingest task, read by the local /status page -- an int write is atomic on this
+// core, so no lock is needed for a value that is only ever displayed.
+//   0 = nothing sent yet, <0 = transport-level failure (see HTTPClient errors),
+//   200/401/... = what the hub actually replied.
+// This exists so the config page can answer "did that key work?" on the spot
+// rather than sending you to the Pi's log.
+volatile int  lastIngestHttp = 0;
 static Device kragwagDev("KragWag", "esp.device.other", NULL);
 
 // -----------------------------------------------------------------------------
@@ -662,13 +688,17 @@ void ingestTask(void* pv) {
       if (http.begin(url)) {
         http.addHeader("Content-Type", "application/json");
         if (key.length() > 0) http.addHeader("Authorization", "Bearer " + key);
-        http.POST(payload);
+        lastIngestHttp = http.POST(payload);
         http.end();
       }
     }
   }
   vTaskDelete(NULL);
 }
+
+// Commissioning helpers, defined further down with the safety logic.
+bool commissioningActive();
+void setCommissioning(bool on);
 
 void sendIngest(DhwElement &el) {
   if (hubUrl.length() == 0 || !WiFi.isConnected()) return;
@@ -677,6 +707,7 @@ void sendIngest(DhwElement &el) {
                     "\"power_w\":" + String(el.lastCurrentA * 230.0f, 1) + ","  // nominal mains V -- no AC voltage sensor on this board
                     "\"current_a\":" + String(el.lastCurrentA, 2) + ","
                     "\"temp_c\":" + String(el.lastTempC, 1) + ","
+                    "\"test_mode\":" + String(commissioningActive() ? 1 : 0) + ","
                     "\"relay_state\":" + String(el.relayOn ? 1 : 0) + "}";
   String* args = new String[3]{ url, hubKey, payload };
   xTaskCreate(ingestTask, "ingest", 8192, args, 1, NULL);
@@ -701,18 +732,29 @@ void pollCommandTask(void* pv) {
         if (code == HTTP_CODE_OK) {
           String body = http.getString();
           // Hand-rolled parse (no ArduinoJson dependency, matching this file's
-          // existing style): response is {"commands":[{...,"action":"on"|"off",...}]}.
-          // If more than one command is queued, the LAST one in the array is the
-          // most recent decision, so we take the last matching token, not the first.
-          int onIdx  = body.lastIndexOf("\"on\"");
-          int offIdx = body.lastIndexOf("\"off\"");
-          if (onIdx < 0 && offIdx < 0) {
-            // no pending command -- leave el->pendingHubCmd untouched (-1 default)
-          } else if (onIdx > offIdx) {
-            el->pendingHubCmd = 1;
-          } else {
-            el->pendingHubCmd = 0;
+          // existing style): response is
+          //   {"commands":[{...,"action":"on"|"off"|"test_on"|"test_off",...}]}
+          //
+          // Match on the whole "action":"..." pair rather than a bare token.
+          // Searching for "on" alone would also hit "test_on", which is exactly
+          // the sort of accidental match that turns a heater on by mistake.
+          // Starlette serialises with no spaces, so the pair is contiguous.
+          int last = -1;
+          int cmd = -1;          // 1 on, 0 off, 2 test_on, 3 test_off
+          struct { const char* tag; int val; } ACTIONS[] = {
+            { "\"action\":\"on\"",       1 },
+            { "\"action\":\"off\"",      0 },
+            { "\"action\":\"test_on\"",  2 },
+            { "\"action\":\"test_off\"", 3 },
+          };
+          for (unsigned i = 0; i < sizeof(ACTIONS) / sizeof(ACTIONS[0]); i++) {
+            int at = body.lastIndexOf(ACTIONS[i].tag);
+            if (at > last) { last = at; cmd = ACTIONS[i].val; }
           }
+          if (cmd == 2)      { setCommissioning(true); }
+          else if (cmd == 3) { setCommissioning(false); }
+          else if (cmd >= 0) { el->pendingHubCmd = cmd; }
+          // cmd < 0 means nothing queued -- leave pendingHubCmd at its -1 default
         }
         http.end();
       }
@@ -857,11 +899,58 @@ const char* elementStatusText(const DhwElement &el) {
                ? "Safety lockout: sensor fault"
                : "Safety lockout: overtemp";
   }
+  if (commissioningActive()) {
+    return el.relayOn ? "TEST MODE: energised" : "TEST MODE: ready";
+  }
   return el.relayOn ? "Heating" : "Idle";
+}
+
+// Non-zero while commissioning mode is live; the value is the millis() deadline.
+unsigned long commissionUntilMs = 0;
+
+bool commissioningActive() {
+  if (commissionUntilMs == 0) return false;
+  // Signed comparison so this still behaves correctly across the millis() wrap.
+  return (long)(commissionUntilMs - millis()) > 0;
+}
+
+unsigned long commissioningSecondsLeft() {
+  if (!commissioningActive()) return 0;
+  return (commissionUntilMs - millis()) / 1000UL;
+}
+
+void setCommissioning(bool on) {
+  bool wasOn = commissioningActive();
+  if (on) {
+    commissionUntilMs = millis() + DHW_COMMISSION_MS;
+    if (!wasOn) {
+      Serial.println("[TEST] commissioning mode ON (15 min, relays may energise)");
+      esp_rmaker_raise_alert("Test mode ON: relays can energise for 15 min");
+    }
+  } else {
+    commissionUntilMs = 0;
+    if (wasOn) {
+      // Drop any standing request so re-entering test mode never resumes a
+      // relay the user has since forgotten about.
+      elementTop.desiredOn = false;
+      elementBottom.desiredOn = false;
+      Serial.println("[TEST] commissioning mode OFF");
+      esp_rmaker_raise_alert("Test mode ended, elements off");
+    }
+  }
 }
 
 void updateElementSafety(DhwElement &el) {
   unsigned long now = millis();
+
+  // Expire commissioning mode centrally, and force both elements off as it goes.
+  static bool commissionWasActive = false;
+  bool commissioning = commissioningActive();
+  if (commissionWasActive && !commissioning) {
+    setCommissioning(false);          // clears desiredOn on both elements
+    commissioning = false;
+  }
+  commissionWasActive = commissioning;
 
   // -- Read the temperature sensor for this element ---------------------------
   float vOut = ads1115ReadVoltage(el.tempAdcChannel);
@@ -876,9 +965,13 @@ void updateElementSafety(DhwElement &el) {
   // -- Hard safety ceiling with hysteresis reset -------------------------------
   bool wasLockedOut = el.safetyLockout;
   if (!sensorHealthy) {
-    el.safetyLockout = true;                              // fail safe: no trustworthy reading
+    // Fail safe on a missing reading -- UNLESS commissioning mode is explicitly
+    // live. This is the only branch test mode touches. Note the ordering: the
+    // overtemp branch below is a separate case and is never reachable while the
+    // sensor is unhealthy, so relaxing this one cannot hide a hot tank.
+    el.safetyLockout = !commissioning;
   } else if (el.lastTempC >= DHW_SAFETY_MAX_C) {
-    el.safetyLockout = true;                               // overtemp
+    el.safetyLockout = true;                               // overtemp -- wins regardless of test mode
   } else if (el.safetyLockout && el.lastTempC <= DHW_SAFETY_RESET_C) {
     el.safetyLockout = false;                               // back in safe range -- re-arm
   }
@@ -1089,6 +1182,114 @@ void setupElementParams(DhwElement &el) {
 // -----------------------------------------------------------------------------
 //  SETUP
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+//  LOCAL CONFIG PAGE  (http://<board-ip>:8080/)
+//
+//  The Hub URL and Hub API Key have to be settable without the internet. They
+//  are what lets this board talk to the Pi on the same LAN, so making them
+//  depend on a round trip through a cloud service is backwards -- and in
+//  practice RainMaker param writes did not reach this board at all, which is
+//  why this page exists.
+//
+//  Deliberately not authenticated: it is reachable only from the LAN, and it
+//  never displays the key it holds -- only whether one is set. Anyone already
+//  on this network can reach the Pi directly anyway, so a password here would
+//  be theatre rather than a boundary.
+// -----------------------------------------------------------------------------
+static const char CONFIG_PAGE[] PROGMEM = R"KWCFG(<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KragWag Setup</title>
+<style>
+*{box-sizing:border-box}html{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#181a1b;color:#f4f5f5;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}.card{width:100%;max-width:420px;padding:30px;border:1px solid #3b4042;border-radius:18px;background:#242729;box-shadow:0 18px 45px #0006}h1{margin:0 0 24px;font-size:1.75rem;line-height:1.2;letter-spacing:-.02em}.status{display:grid;gap:1px;margin:0 0 26px;border:1px solid #3b4042;border-radius:12px;overflow:hidden;background:#3b4042}.row{padding:12px 14px;background:#2b2f31}.label,label{display:block;margin:0 0 6px;color:#aeb6b9;font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase}.value{display:block;color:#fff;font-size:.95rem;line-height:1.35;overflow-wrap:anywhere}label{margin:0 0 8px}.field{margin:0 0 18px}input,button{width:100%;min-height:48px;border-radius:10px;font:inherit}input{padding:11px 13px;border:1px solid #555d60;background:#191b1c;color:#fff;outline:0}input:focus{border-color:#6dc8af;box-shadow:0 0 0 3px #6dc8af33}button{margin-top:6px;border:0;background:#6dc8af;color:#10251f;font-weight:750;cursor:pointer}button:hover{background:#82d4bd}button:focus-visible{outline:3px solid #baf3e3;outline-offset:3px}button:active{transform:translateY(1px)}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>KragWag Setup</h1>
+<section class="status" aria-label="Current status">
+<div class="row"><span class="label">Hub URL</span><span class="value">{{HUBURL}}</span></div>
+<div class="row"><span class="label">API key</span><span class="value">{{KEYSTATE}}</span></div>
+<div class="row"><span class="label">Last hub reply</span><span class="value">{{HUBREPLY}}</span></div>
+<div class="row"><span class="label">Firmware build</span><span class="value">{{BUILD}}</span></div>
+</section>
+<form action="/config" method="post">
+<div class="field"><label for="huburl">Hub URL</label><input id="huburl" name="huburl" type="text" value="{{HUBURL}}"></div>
+<div class="field"><label for="hubkey">Hub API Key</label><input id="hubkey" name="hubkey" type="text" autocomplete="off" spellcheck="false"></div>
+<button type="submit">Save</button>
+</form>
+</main>
+</body>
+</html>
+)KWCFG";
+
+// Human-readable form of lastIngestHttp for the status card.
+String hubReplyText() {
+  int c = lastIngestHttp;
+  if (c == 0)   return "nothing sent yet";
+  if (c == 200) return "200 accepted";
+  if (c == 401) return "401 rejected - key wrong or missing";
+  if (c <  0)   return String("could not reach hub (") + c + ")";
+  return String(c) + " unexpected";
+}
+
+void handleConfigPage() {
+  String page = FPSTR(CONFIG_PAGE);
+  page.replace("{{HUBURL}}",   hubUrl.length() ? hubUrl : String("(not set)"));
+  // Never render the key itself -- length alone is enough to tell a typo from
+  // an empty field, without putting the secret on a screen or in a cache.
+  page.replace("{{KEYSTATE}}", hubKey.length()
+                                 ? String("set (") + hubKey.length() + " characters)"
+                                 : String("not set"));
+  page.replace("{{HUBREPLY}}", hubReplyText());
+  page.replace("{{BUILD}}",    String(FIRMWARE_BUILD));
+  localServer.send(200, "text/html", page);
+}
+
+void handleConfigSave() {
+  bool changed = false;
+
+  if (localServer.hasArg("huburl")) {
+    String v = localServer.arg("huburl");
+    v.trim();
+    if (v.length() > 0 && v != hubUrl) { hubUrl = v; changed = true; }
+  }
+
+  // An empty key field means "leave it alone", so reloading the page and
+  // pressing Save does not silently wipe a working key.
+  if (localServer.hasArg("hubkey")) {
+    String v = localServer.arg("hubkey");
+    v.trim();
+    if (v.length() > 0 && v != hubKey) { hubKey = v; changed = true; }
+  }
+
+  if (changed) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString(NVS_KEY_HUB_URL, hubUrl);
+    prefs.putString(NVS_KEY_HUB_KEY, hubKey);
+    prefs.end();
+    kragwagDev.updateAndReportParam(PN_HUB_URL, hubUrl.c_str());
+    lastIngestHttp = 0;                 // forget the old verdict; re-prove it
+    Serial.printf("[CFG] saved via local page (url=%s, key len=%u)\n",
+                  hubUrl.c_str(), (unsigned)hubKey.length());
+  }
+
+  localServer.sendHeader("Location", "/");
+  localServer.send(303, "text/plain", "Saved");
+}
+
+void handleStatusJson() {
+  String json = String("{\"build\":") + FIRMWARE_BUILD
+              + ",\"hub_url\":\"" + hubUrl + "\""
+              + ",\"key_len\":" + hubKey.length()
+              + ",\"last_hub_http\":" + lastIngestHttp
+              + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+  localServer.sendHeader("Access-Control-Allow-Origin", "*");
+  localServer.send(200, "application/json", json);
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -1223,6 +1424,10 @@ void setup() {
 
   RMaker.enableSchedule();
   RMaker.start();
+
+  localServer.on("/",       HTTP_GET,  handleConfigPage);
+  localServer.on("/config", HTTP_POST, handleConfigSave);
+  localServer.on("/status", HTTP_GET,  handleStatusJson);
 
   localServer.on("/rssi", HTTP_GET, []() {
     String json = String("{\"rssi\":") + WiFi.RSSI() + "}";

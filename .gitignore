@@ -10,3 +10,6 @@ compile_stdout.txt
 
 # Zipped source backups (the .ino itself is tracked)
 *.ino.zip
+ 
+# auto-saved by the Claude desktop app 
+Claude outputs/
