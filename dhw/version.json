@@ -1,0 +1,7 @@
+{
+  "variant": "kragwag-dhw",
+  "build": 5,
+  "url": "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/kragwag-dhw.bin",
+  "md5": "34b2c978dccb647b779b924c48a469f6",
+  "notes": "Separate OTA channel for the DHW cylinder controller. The fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
+}
