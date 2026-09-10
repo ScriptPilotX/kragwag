@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    3        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    4        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -739,22 +739,38 @@ void pollCommandTask(void* pv) {
           // Searching for "on" alone would also hit "test_on", which is exactly
           // the sort of accidental match that turns a heater on by mistake.
           // Starlette serialises with no spaces, so the pair is contiguous.
-          int last = -1;
-          int cmd = -1;          // 1 on, 0 off, 2 test_on, 3 test_off
-          struct { const char* tag; int val; } ACTIONS[] = {
-            { "\"action\":\"on\"",       1 },
-            { "\"action\":\"off\"",      0 },
-            { "\"action\":\"test_on\"",  2 },
-            { "\"action\":\"test_off\"", 3 },
-          };
-          for (unsigned i = 0; i < sizeof(ACTIONS) / sizeof(ACTIONS[0]); i++) {
-            int at = body.lastIndexOf(ACTIONS[i].tag);
-            if (at > last) { last = at; cmd = ACTIONS[i].val; }
+          // TWO independent decisions, not one. A commissioning command and an
+          // on/off command can arrive in the same batch -- the hub's control
+          // loop is perfectly capable of queueing an "on" a few seconds after
+          // you tap Test mode. Scanning once and taking whichever tag appeared
+          // last let that "on" swallow the "test_on" that was meant to make it
+          // possible, so test mode silently never engaged. Seen on the bench.
+          int modeAt = -1;
+          bool modeOn = false;
+          {
+            int a = body.lastIndexOf("\"action\":\"test_on\"");
+            int b = body.lastIndexOf("\"action\":\"test_off\"");
+            if (a > modeAt) { modeAt = a; modeOn = true;  }
+            if (b > modeAt) { modeAt = b; modeOn = false; }
           }
-          if (cmd == 2)      { setCommissioning(true); }
-          else if (cmd == 3) { setCommissioning(false); }
-          else if (cmd >= 0) { el->pendingHubCmd = cmd; }
-          // cmd < 0 means nothing queued -- leave pendingHubCmd at its -1 default
+
+          // "\"action\":\"on\"" cannot match inside "\"action\":\"test_on\"" --
+          // the colon has to be immediately followed by the opening quote --
+          // so these two scans genuinely do not see each other's tags.
+          int powerAt = -1;
+          int powerCmd = -1;     // 1 on, 0 off
+          {
+            int a = body.lastIndexOf("\"action\":\"on\"");
+            int b = body.lastIndexOf("\"action\":\"off\"");
+            if (a > powerAt) { powerAt = a; powerCmd = 1; }
+            if (b > powerAt) { powerAt = b; powerCmd = 0; }
+          }
+
+          // Mode first, so an "on" arriving alongside is evaluated against the
+          // mode this same batch just asked for rather than the previous one.
+          if (modeAt >= 0)   setCommissioning(modeOn);
+          if (powerCmd >= 0) el->pendingHubCmd = powerCmd;
+          // Neither found means nothing was queued -- pendingHubCmd stays -1
         }
         http.end();
       }
@@ -1285,6 +1301,7 @@ void handleStatusJson() {
               + ",\"hub_url\":\"" + hubUrl + "\""
               + ",\"key_len\":" + hubKey.length()
               + ",\"last_hub_http\":" + lastIngestHttp
+              + ",\"test_mode\":" + (commissioningActive() ? 1 : 0)
               + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
   localServer.sendHeader("Access-Control-Allow-Origin", "*");
   localServer.send(200, "application/json", json);
