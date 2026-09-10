@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    6        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    7        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -106,6 +106,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
+#include "esp_ota_ops.h"
 #include <Wire.h>
 #include <math.h>
 
@@ -810,6 +811,38 @@ inline void setOtaStatus(const char *msg) {
 // reach it -- so the board says it itself.
 String otaLastResult = "not checked yet";
 
+// A freshly OTA'd image boots once in PENDING_VERIFY. If nothing confirms it
+// works, the bootloader reverts to the previous partition at the NEXT power
+// cycle -- which is exactly what happened after the Build 6 update: it ran
+// fine, then quietly went back to Build 5 when the board was next powered up.
+// So the image must confirm itself, and only once it has actually proved it
+// works. That proof is WiFi up and the local server serving, which is why
+// this is called from the loop rather than from setup().
+bool otaImageConfirmed = false;   // true once this image is marked valid
+bool otaWasPendingVerify = false; // true if this boot started unconfirmed
+
+void confirmRunningImage() {
+  if (otaImageConfirmed) return;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state;
+  if (running == NULL || esp_ota_get_state_partition(running, &state) != ESP_OK) {
+    otaImageConfirmed = true;          // nothing to confirm on this build
+    return;
+  }
+  if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+    otaWasPendingVerify = true;
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+      Serial.println("[OTA] running image marked valid, rollback cancelled");
+      otaLastResult = String("Build ") + FIRMWARE_BUILD + " confirmed, update is permanent";
+    } else {
+      Serial.println("[OTA] FAILED to mark image valid -- it will roll back");
+      otaLastResult = "WARNING: could not confirm this image, it will roll back";
+      return;                          // leave unconfirmed so we retry
+    }
+  }
+  otaImageConfirmed = true;
+}
+
 // Minimal JSON field readers. The manifest is small, written by our own
 // release step, and this file deliberately carries no JSON library.
 String jsonStr(const String& src, const char* key) {
@@ -1430,6 +1463,13 @@ void handleConfigSave() {
   localServer.send(303, "text/plain", "Saved");
 }
 
+void handleRestart() {
+  localServer.sendHeader("Location", "/");
+  localServer.send(303, "text/plain", "Restarting");
+  delay(300);                 // let the response actually leave
+  esp_restart();
+}
+
 void handleStatusJson() {
   String json = String("{\"build\":") + FIRMWARE_BUILD
               + ",\"hub_url\":\"" + hubUrl + "\""
@@ -1439,6 +1479,8 @@ void handleStatusJson() {
               + ",\"free_heap\":" + ESP.getFreeHeap()
               + ",\"ota_variant\":\"" OTA_VARIANT "\""
               + ",\"ota_last\":\"" + otaLastResult + "\""
+              + ",\"image_confirmed\":" + (otaImageConfirmed ? 1 : 0)
+              + ",\"was_pending_verify\":" + (otaWasPendingVerify ? 1 : 0)
               + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
   localServer.sendHeader("Access-Control-Allow-Origin", "*");
   localServer.send(200, "application/json", json);
@@ -1591,6 +1633,7 @@ void setup() {
   localServer.on("/config", HTTP_POST, handleConfigSave);
   localServer.on("/status", HTTP_GET,  handleStatusJson);
   localServer.on("/ota",    HTTP_POST, handleOtaRequest);
+  localServer.on("/restart", HTTP_POST, handleRestart);
 
   localServer.on("/rssi", HTTP_GET, []() {
     String json = String("{\"rssi\":") + WiFi.RSSI() + "}";
@@ -1683,6 +1726,8 @@ void loop() {
     localServer.begin();
     localServerStarted = true;
     kragwagDev.updateAndReportParam(PN_LOCAL_IP, WiFi.localIP().toString().c_str());
+    // WiFi is up and we are serving: this image works. Keep it.
+    confirmRunningImage();
     if (otaRetryAfterBoot) otaCheckRequested = true;   // resume the interrupted update
   }
   if (localServerStarted) localServer.handleClient();
