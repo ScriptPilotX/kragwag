@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    7        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    10        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
