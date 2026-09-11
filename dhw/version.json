@@ -1,7 +1,7 @@
 {
   "variant": "kragwag-dhw",
-  "build": 10,
+  "build": 11,
   "url": "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/kragwag-dhw.bin",
-  "md5": "64b3aa85ebcd9cc61585c438c2d2be5c",
-  "notes": "Build 10 is Build 7 unchanged apart from the build number. It replaces the Build 9 bench diagnostic over the air: Build 9 forced GPIO10 to blink every 3 seconds and masked the real relay path. Fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
+  "md5": "7e4cc6174353f8f90f2193dafaa3fa77",
+  "notes": "Retries a hub poll that failed instead of forfeiting the interval, polls every 5s instead of 20s, and declines to spawn the poll task while the heartbeat's TLS spike has the heap. Fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
 }
