@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    10        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    11        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -163,7 +163,9 @@
 #define DHW_SAFETY_CHECK_MS   2000    // how often the on-device safety loop re-evaluates
 #define DHW_CURRENT_CHECK_MS  10000   // how often current is sampled (200ms blocking each time)
 #define DHW_HUB_REPORT_MS     30000   // how often telemetry is POSTed to kragwag-hub
-#define DHW_HUB_POLL_MS       20000   // how often pending-commands is polled
+#define DHW_HUB_POLL_MS       5000    // how often pending-commands is polled
+#define DHW_HUB_POLL_RETRY_MS 2000    // ...and how soon to retry one that failed
+#define DHW_POLL_MIN_HEAP     24000   // below this, do not even attempt the poll
 
 // -- Hardware constants --------------------------------------------------------
 #define ADC_DIVIDER_RATIO  (50.0f / 11.0f)
@@ -242,6 +244,9 @@ unsigned long lastSafetyCheck    = 0;
 unsigned long lastCurrentCheck   = 0;
 unsigned long lastHubReport      = 0;
 unsigned long lastHubPoll        = 0;
+// Set by any poll that did not come back with a 200, so the next loop pass
+// retries promptly instead of forfeiting the whole interval.
+volatile bool hubPollFailed      = false;
 
 bool          syncNeeded = false;
 bool          provDeinitNeeded = false;
@@ -737,12 +742,17 @@ void pollCommandTask(void* pv) {
     DhwElement* el = pa->el;
     delete pa;
 
+    // Every exit below that is not a clean 200 leaves this false, and the loop
+    // retries. Previously all of them were silent and cost a full interval.
+    bool ok = false;
+
     if (url.length() > 0 && el != nullptr) {
       HTTPClient http;
       if (http.begin(url)) {
         if (key.length() > 0) http.addHeader("Authorization", "Bearer " + key);
         int code = http.GET();
         if (code == HTTP_CODE_OK) {
+          ok = true;
           String body = http.getString();
           // Hand-rolled parse (no ArduinoJson dependency, matching this file's
           // existing style): response is
@@ -788,15 +798,26 @@ void pollCommandTask(void* pv) {
         http.end();
       }
     }
+
+    if (!ok) hubPollFailed = true;
   }
   vTaskDelete(NULL);
 }
 
 void pollHubCommand(DhwElement &el) {
   if (hubUrl.length() == 0 || !WiFi.isConnected()) return;
+
+  // The heartbeat's TLS POST takes roughly 21 KB while it runs. Spawning an
+  // 8 KB task plus an HTTPClient into what is left is what used to fail, so
+  // decline early and retry rather than burn the attempt.
+  if (ESP.getFreeHeap() < DHW_POLL_MIN_HEAP) { hubPollFailed = true; return; }
+
   String url = hubUrl + "/api/pending-commands?element=" + String(el.name);
   PollArgs* pa = new PollArgs{ url, hubKey, &el };
-  xTaskCreate(pollCommandTask, "poll", 8192, pa, 1, NULL);
+  if (xTaskCreate(pollCommandTask, "poll", 8192, pa, 1, NULL) != pdPASS) {
+    delete pa;                 // this leaked on every failure before
+    hubPollFailed = true;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -1703,10 +1724,17 @@ void loop() {
   }
 
   // -- Poll kragwag-hub for pending commands --------------------------------
-  if (now - lastHubPoll >= DHW_HUB_POLL_MS) {
-    lastHubPoll = now;
-    pollHubCommand(elementTop);
-    pollHubCommand(elementBottom);
+  {
+    unsigned long pollWait = hubPollFailed ? DHW_HUB_POLL_RETRY_MS
+                                           : DHW_HUB_POLL_MS;
+    if (now - lastHubPoll >= pollWait) {
+      lastHubPoll = now;
+      // Cleared before polling; the tasks set it again if they fail. They
+      // finish long before the shortest wait above, so this cannot race.
+      hubPollFailed = false;
+      pollHubCommand(elementTop);
+      pollHubCommand(elementBottom);
+    }
   }
 
   // -- Voltage check — every 60s ---------------------------------------------
