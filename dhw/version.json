@@ -1,7 +1,7 @@
 {
   "variant": "kragwag-dhw",
-  "build": 7,
+  "build": 10,
   "url": "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/kragwag-dhw.bin",
-  "md5": "18671c0111c28784041ea36684012d72",
-  "notes": "Separate OTA channel for the DHW cylinder controller. The fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
+  "md5": "64b3aa85ebcd9cc61585c438c2d2be5c",
+  "notes": "Build 10 is Build 7 unchanged apart from the build number. It replaces the Build 9 bench diagnostic over the air: Build 9 forced GPIO10 to blink every 3 seconds and masked the real relay path. Fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
 }
