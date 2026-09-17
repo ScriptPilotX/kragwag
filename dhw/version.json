@@ -1,7 +1,7 @@
 {
   "variant": "kragwag-dhw",
-  "build": 11,
+  "build": 12,
   "url": "https://raw.githubusercontent.com/ScriptPilotX/kragwag/main/dhw/kragwag-dhw.bin",
-  "md5": "7e4cc6174353f8f90f2193dafaa3fa77",
-  "notes": "Retries a hub poll that failed instead of forfeiting the interval, polls every 5s instead of 20s, and declines to spawn the poll task while the heartbeat's TLS spike has the heap. Fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
+  "md5": "7d4ea7c631c9b069a3e739216f68cb83",
+  "notes": "Build 12 fixes the current measurement. The RMS was computed about a midpoint that never converged in a 200ms window, so a steady load read anywhere from 0.01 A to 1.33 A; it now uses the window's own mean. The ADS1115 moves from 128 to 860 SPS with I2C at 400 kHz, taking the window from about 25 samples to about 120. NTC_SUPPLY_VOLTS is the measured 3.37 rather than an assumed 3.3. Fence/alarm boards read version.txt and kragwag.bin at the repo root and must never read this."
 }
