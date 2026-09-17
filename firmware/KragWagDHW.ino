@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    11        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    12        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -181,7 +181,10 @@
 #define DHW_SAFETY_MAX_C      65.0f   // hard ceiling -- relay forced off at/above this
 #define DHW_SAFETY_RESET_C    60.0f   // hysteresis -- must drop back below this to re-arm
 #define DHW_SENSOR_TIMEOUT_MS 30000UL // no valid temp reading in this long -> fail safe (off)
-#define NTC_SUPPLY_VOLTS      3.3f    // assumed ADS1115/NTC divider supply -- CONFIRM against hardware
+#define NTC_SUPPLY_VOLTS      3.37f   // MEASURED at the DC-DC module under load, 17 Sept 2026.
+                                      // The divider maths divides by this, so an assumed 3.3 here
+                                      // read about a degree low at room temperature. Re-measure and
+                                      // change this if the module is ever swapped.
 
 // -- Commissioning ("test") mode ------------------------------------------------
 // Lets the relays be driven on the bench BEFORE any temperature sensor exists,
@@ -350,12 +353,19 @@ void runLed(uint8_t pin, LedPattern pattern, LedState &s) {
  */
 void ads1115Init() {
   Wire.begin(PIN_IO0, PIN_IO3);
+  // 400 kHz. At the default 100 kHz the per-sample I2C overhead is comparable
+  // to the conversion itself, which halves how many samples fit in the RMS
+  // window. Both the ADS1115 and the ESP32-C3 do fast mode comfortably.
+  Wire.setClock(400000);
 }
 
 /**
  * Reads one single-ended ADS1115 channel in single-shot mode.
  *
- * Uses the +/-4.096V PGA range and 128 samples-per-second data rate.
+ * Uses the +/-4.096V PGA range and the 860 samples-per-second data rate.
+ * The rate matters: the RMS current measurement samples this in a loop, and at
+ * 128 SPS a 200ms window holds about 25 samples, which is under three points
+ * per 50Hz cycle -- not enough to reconstruct an RMS value.
  * Returns zero if the channel is invalid, an I2C transaction fails, or the
  * conversion does not complete within the timeout.
  */
@@ -370,7 +380,7 @@ int16_t ads1115ReadRaw(uint8_t channel) {
       muxBits |  // MUX: AIN0..AIN3 relative to GND
       0x0200U |  // PGA: +/-4.096V
       0x0100U |  // MODE: single-shot
-      0x0080U |  // DR: 128 SPS
+      0x00E0U |  // DR: 860 SPS
       0x0003U;   // Comparator disabled
 
   Wire.beginTransmission(ADS1115_I2C_ADDRESS);
@@ -473,8 +483,10 @@ float ntcVoltageToCelsius(float vOut, float vSupply) {
 // -----------------------------------------------------------------------------
 
 #define SCT_VOLTS_PER_AMP    0.05f  // 20A/1V clamp -- MUST confirm against actual clamp datasheet
-#define SCT_SAMPLE_WINDOW_MS 200UL
-#define SCT_MIDPOINT_ALPHA   0.01f
+#define SCT_SAMPLE_WINDOW_MS 200UL  // 10 complete 50Hz cycles
+#define SCT_MIN_SAMPLES      40     // below this the window caught too little
+                                    // of the waveform to mean anything, so say
+                                    // nothing rather than publish a figure
 
 /**
  * Samples a DC-biased SCT-013 waveform and estimates its RMS current.
@@ -484,6 +496,11 @@ float ntcVoltageToCelsius(float vOut, float vSupply) {
  * It must not be called from an interrupt. Called at most every
  * DHW_CURRENT_CHECK_MS (10s), not every safety-loop tick, so this blocking
  * window never delays the overtemp safety check by more than ~200ms.
+ *
+ * Accuracy note worth carrying: the SCT-013 20A/1V clamp is specified linear
+ * from roughly 10% of range upward, so about 2A. A 3kW element at 13A is well
+ * inside that. Small household loads are not, and will read poorly however
+ * good the sampling is.
  */
 float sctReadAmps(uint8_t channel) {
   if (channel > 3) {
@@ -491,33 +508,37 @@ float sctReadAmps(uint8_t channel) {
   }
 
   uint32_t numSamples = 0;
-  float midpoint = 0.0f;
+  double sum = 0.0;
   double sumOfSquares = 0.0;
   const uint32_t startTime = millis();
 
   while ((uint32_t)(millis() - startTime) < SCT_SAMPLE_WINDOW_MS) {
-    const float sample = ads1115ReadVoltage(channel);
-
-    if (numSamples == 0) {
-      midpoint = sample;
-    } else {
-      midpoint += (sample - midpoint) * SCT_MIDPOINT_ALPHA;
-    }
-
-    const float centeredSample = sample - midpoint;
-    sumOfSquares +=
-        (double)centeredSample * (double)centeredSample;
+    const double sample = (double)ads1115ReadVoltage(channel);
+    sum += sample;
+    sumOfSquares += sample * sample;
     ++numSamples;
   }
 
-  if (numSamples == 0 || SCT_VOLTS_PER_AMP <= 0.0f) {
+  if (numSamples < SCT_MIN_SAMPLES || SCT_VOLTS_PER_AMP <= 0.0f) {
     return 0.0f;
   }
 
-  const float rmsVoltage =
-      sqrtf((float)(sumOfSquares / (double)numSamples));
+  // RMS about the waveform's own mean, in one pass: var = E[x^2] - E[x]^2.
+  //
+  // The mean IS the DC bias the clamp sits on, so this needs no prior
+  // knowledge of where the bias divider actually landed and no settling
+  // time. The previous version chased the midpoint with an exponential
+  // average at alpha 0.01, which needs several hundred samples to converge
+  // and only ever got about 25 -- so in practice it centred the waveform on
+  // wherever the first sample happened to fall, and the answer moved with it.
+  // On the bench that showed as 0.01 A to 1.33 A readings from a steady load.
+  const double mean = sum / (double)numSamples;
+  double variance = (sumOfSquares / (double)numSamples) - (mean * mean);
+  if (variance < 0.0) {
+    variance = 0.0;  // floating point rounding only; a variance cannot be < 0
+  }
 
-  return rmsVoltage / SCT_VOLTS_PER_AMP;
+  return (float)(sqrt(variance) / (double)SCT_VOLTS_PER_AMP);
 }
 
 // -----------------------------------------------------------------------------
