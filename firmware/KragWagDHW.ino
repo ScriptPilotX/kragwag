@@ -74,7 +74,7 @@
 
 // -- Firmware version ----------------------------------------------------------
 #define FIRMWARE_VERSION  "3.0.0"
-#define FIRMWARE_BUILD    12        // DHW branch build counter -- independent of the
+#define FIRMWARE_BUILD    13        // DHW branch build counter -- independent of the
                                     // alarm firmware's build numbers on main.
 
 // -- GitHub OTA ----------------------------------------------------------------
@@ -482,7 +482,14 @@ float ntcVoltageToCelsius(float vOut, float vSupply) {
 //  SCT-013 AC CURRENT RMS MEASUREMENT
 // -----------------------------------------------------------------------------
 
-#define SCT_VOLTS_PER_AMP    0.05f  // 20A/1V clamp -- MUST confirm against actual clamp datasheet
+#define SCT_VOLTS_PER_AMP    0.05f  // 20A/1V clamp, confirmed against the part fitted
+
+// MEASURED at the supply, 17 Sept 2026. There is no AC voltage sensor on this
+// board, so every power figure it reports is current x this constant. The
+// CURRENT is measured; the wattage is an estimate built on top of it. UK supply
+// is permitted to sit anywhere between 216 and 253 V and moves with load on the
+// street, so treat the figure as good to a few percent, never as a meter.
+#define MAINS_NOMINAL_VOLTS  241.6f
 #define SCT_SAMPLE_WINDOW_MS 200UL  // 10 complete 50Hz cycles
 #define SCT_MIN_SAMPLES      40     // below this the window caught too little
                                     // of the waveform to mean anything, so say
@@ -743,7 +750,7 @@ void sendIngest(DhwElement &el) {
   if (hubUrl.length() == 0 || !WiFi.isConnected()) return;
   String url = hubUrl + "/ingest";
   String payload = "{\"element\":\"" + String(el.name) + "\","
-                    "\"power_w\":" + String(el.lastCurrentA * 230.0f, 1) + ","  // nominal mains V -- no AC voltage sensor on this board
+                    "\"power_w\":" + String(el.lastCurrentA * MAINS_NOMINAL_VOLTS, 1) + ","
                     "\"current_a\":" + String(el.lastCurrentA, 2) + ","
                     "\"temp_c\":" + String(el.lastTempC, 1) + ","
                     "\"test_mode\":" + String(commissioningActive() ? 1 : 0) + ","
